@@ -13,6 +13,10 @@ from pathlib import Path
 import math
 from enum import Enum
 import hashlib
+import urllib3
+
+# Disable SSL warnings for clean output
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class DataSource(Enum):
     CACHE = "cache"
@@ -46,7 +50,7 @@ class CityConfig:
 class ResourceManager:
     def __init__(self):
         self.base_path = Path.home() / ".worldmatrix"
-        self.base_path.mkdir(exist_ok=True)
+        self.base_path.mkdir(exist_ok=True, parents=True)
         
         self.time_db = self.base_path / "temporal.db"
         self.weather_db = self.base_path / "atmospheric.db"
@@ -66,8 +70,11 @@ class ResourceManager:
         }
         
         if self.config_file.exists():
-            with open(self.config_file) as f:
-                self.config = {**default_config, **json.load(f)}
+            try:
+                with open(self.config_file) as f:
+                    self.config = {**default_config, **json.load(f)}
+            except json.JSONDecodeError:
+                self.config = default_config
         else:
             self.config = default_config
             self.save_configuration()
@@ -181,12 +188,11 @@ class TemporalAcquisition:
         self.session.timeout = 5
     
     def acquire_temporal(self, city_id: str) -> TemporalData:
+        config = self.CITIES[city_id]
         cached = self.resource_mgr.retrieve_temporal(city_id, 
                     self.resource_mgr.config["cache_ttl"])
         if cached:
             return cached
-        
-        config = self.CITIES[city_id]
         
         api_time = self._acquire_from_worldtimeapi(city_id, config)
         if api_time:
@@ -194,6 +200,7 @@ class TemporalAcquisition:
             return api_time
         
         fallback_time = self._acquire_fallback(config)
+        fallback_time.city = city_id  # Ensure correct city ID
         self.resource_mgr.store_temporal(fallback_time)
         return fallback_time
     
@@ -205,7 +212,7 @@ class TemporalAcquisition:
             if api_key:
                 url += f"?key={api_key}"
             
-            response = self.session.get(url)
+            response = self.session.get(url, timeout=3)
             if response.status_code == 200:
                 data = response.json()
                 dt_str = data['datetime'].replace('Z', '+00:00')
@@ -219,7 +226,8 @@ class TemporalAcquisition:
                     timestamp=time.time(),
                     source=DataSource.API
                 )
-        except:
+        except Exception as e:
+            # Silent fail - use fallback
             pass
         return None
     
@@ -228,7 +236,7 @@ class TemporalAcquisition:
         now = datetime.now(tz)
         
         return TemporalData(
-            city=config.timezone.split('/')[-1].lower(),
+            city=config.timezone.split('/')[-1].lower().replace('_', ''),
             time_str=now.strftime("%Y-%m-%d %H:%M:%S %Z%z"),
             timestamp=time.time(),
             source=DataSource.FALLBACK
@@ -249,7 +257,7 @@ class AtmosphericAcquisition:
         config = TemporalAcquisition.CITIES[city_id]
         api_key = self.resource_mgr.config["openweather_api_key"]
         
-        if not api_key:
+        if not api_key or api_key.strip() == "":
             return self._generate_fallback_data(city_id, config)
         
         weather_data = self._acquire_from_openweather(config, api_key)
@@ -264,13 +272,24 @@ class AtmosphericAcquisition:
     def _acquire_from_openweather(self, config: CityConfig, api_key: str) -> Optional[AtmosphericData]:
         try:
             base_url = "https://api.openweathermap.org/data/2.5/weather"
-            params = {
-                'id': config.weather_api_id,
-                'appid': api_key,
-                'units': self.resource_mgr.config['units']
-            }
+            units = self.resource_mgr.config.get('units', 'metric')
             
-            response = self.session.get(base_url, params=params)
+            # Use coordinates if no city ID
+            if config.weather_api_id:
+                params = {
+                    'id': config.weather_api_id,
+                    'appid': api_key,
+                    'units': units
+                }
+            else:
+                params = {
+                    'lat': config.coordinates[0],
+                    'lon': config.coordinates[1],
+                    'appid': api_key,
+                    'units': units
+                }
+            
+            response = self.session.get(base_url, params=params, timeout=3)
             if response.status_code == 200:
                 data = response.json()
                 
@@ -283,7 +302,8 @@ class AtmosphericAcquisition:
                     timestamp=time.time(),
                     source=DataSource.API
                 )
-        except:
+        except Exception as e:
+            # Fallback to generated data
             pass
         return None
     
@@ -291,25 +311,48 @@ class AtmosphericAcquisition:
         tz = pytz.timezone(config.timezone)
         now = datetime.now(tz)
         month = now.month
+        hour = now.hour
         
-        base_temp = {
+        # Base temperatures by city
+        base_temps = {
             "london": 10,
             "tokyo": 16,
             "newyork": 12
-        }.get(city_id, 15)
+        }
         
+        base_temp = base_temps.get(city_id, 15)
+        
+        # Seasonal variation
         temp_variation = math.sin((month - 1) * math.pi / 6) * 8
-        temperature = base_temp + temp_variation
+        # Daily variation
+        hour_variation = math.sin((hour - 12) * math.pi / 12) * 3
         
-        conditions = ["Clear", "Partly Cloudy", "Cloudy", "Light Rain"]
-        condition = conditions[month % 4]
+        temperature = base_temp + temp_variation + hour_variation
+        
+        # Conditions based on month and hour
+        if month in [12, 1, 2]:
+            conditions = ["Clear", "Partly Cloudy", "Cloudy", "Light Snow"]
+        elif month in [6, 7, 8]:
+            conditions = ["Clear", "Partly Cloudy", "Cloudy", "Light Rain"]
+        else:
+            conditions = ["Clear", "Partly Cloudy", "Cloudy", "Light Rain"]
+        
+        condition = conditions[(month + hour) % 4]
+        
+        # Convert to imperial if configured
+        units = self.resource_mgr.config.get("units", "metric")
+        if units == "imperial":
+            temperature = (temperature * 9/5) + 32
+            wind_speed = 3.5 + (month % 3) * 0.621371  # Convert to mph
+        else:
+            wind_speed = 3.5 + (month % 3)
         
         return AtmosphericData(
             city=config.display_name,
             temperature=round(temperature, 1),
             condition=condition,
             humidity=65 + (month * 2) % 20,
-            wind_speed=3.5 + (month % 3),
+            wind_speed=round(wind_speed, 1),
             timestamp=time.time(),
             source=DataSource.FALLBACK
         )
@@ -321,10 +364,17 @@ class DisplayEngine:
         time_parts = temporal.time_str.split()
         time_display = f"{time_parts[1]} {time_parts[2] if len(time_parts) > 2 else ''}"
         
-        temp_unit = "°C" if os.getenv('UNITS', 'metric') == 'metric' else "°F"
+        units = os.getenv('UNITS', 'metric')
+        if units == 'metric':
+            temp_unit = "°C"
+            wind_unit = "m/s"
+        else:
+            temp_unit = "°F"
+            wind_unit = "mph"
+        
         weather_display = f"{atmospheric.temperature:.1f}{temp_unit} | {atmospheric.condition}"
         humidity_display = f"Humidity: {atmospheric.humidity}%"
-        wind_display = f"Wind: {atmospheric.wind_speed:.1f} m/s"
+        wind_display = f"Wind: {atmospheric.wind_speed:.1f}{wind_unit}"
         
         source_symbol = {
             DataSource.CACHE: "⚡",
@@ -332,7 +382,8 @@ class DisplayEngine:
             DataSource.FALLBACK: "🔄"
         }
         
-        source_display = f"{source_symbol[temporal.source]} {temporal.source.value}"
+        symbol = source_symbol.get(temporal.source, "❓")
+        source_display = f"{symbol} {temporal.source.value}"
         
         width = 42
         border = "═" * (width - 2)
@@ -357,24 +408,33 @@ class DisplayEngine:
         headers = ["City", "Time", "Temp", "Condition", "Humidity", "Wind", "Source"]
         rows = []
         
+        units = os.getenv('UNITS', 'metric')
+        temp_unit = "°C" if units == 'metric' else "°F"
+        wind_unit = "m/s" if units == 'metric' else "mph"
+        
         for city_id, (temp, atmos) in city_data.items():
             config = TemporalAcquisition.CITIES[city_id]
             time_parts = temp.time_str.split()
-            time_short = f"{time_parts[1]} {time_parts[2][:3] if len(time_parts) > 2 else ''}"
+            time_short = f"{time_parts[1]}"
+            if len(time_parts) > 2:
+                tz_short = time_parts[2][:3] if len(time_parts[2]) > 2 else time_parts[2]
+                time_short += f" {tz_short}"
             
             source_symbol = {
                 DataSource.CACHE: "⚡",
                 DataSource.API: "📡",
                 DataSource.FALLBACK: "🔄"
-            }[temp.source]
+            }.get(temp.source, "❓")
+            
+            condition_short = atmos.condition[:10] if len(atmos.condition) > 10 else atmos.condition
             
             rows.append([
                 config.display_name,
                 time_short,
-                f"{atmos.temperature:.1f}°",
-                atmos.condition[:12],
+                f"{atmos.temperature:.1f}{temp_unit}",
+                condition_short,
                 f"{atmos.humidity}%",
-                f"{atmos.wind_speed:.1f}m/s",
+                f"{atmos.wind_speed:.1f}{wind_unit}",
                 source_symbol
             ])
         
@@ -384,12 +444,10 @@ class DisplayEngine:
         def create_row(items, widths):
             return "│" + "│".join(f" {item:<{width-2}} " for item, width in zip(items, widths)) + "│"
         
-        separator = "┼".join("─" * w for w in col_widths)
-        
         matrix = []
         matrix.append("┌" + "┬".join("─" * w for w in col_widths) + "┐")
         matrix.append(create_row(headers, col_widths))
-        matrix.append("├" + separator + "┤")
+        matrix.append("├" + "┼".join("─" * w for w in col_widths) + "┤")
         for row in rows:
             matrix.append(create_row(row, col_widths))
         matrix.append("└" + "┴".join("─" * w for w in col_widths) + "┘")
@@ -498,6 +556,7 @@ Operational Protocols:
         
         if args.units:
             self.resource_mgr.config["units"] = args.units
+            os.environ['UNITS'] = args.units
             self.resource_mgr.save_configuration()
             print(f"Units set to {args.units}")
             return
@@ -512,17 +571,20 @@ Operational Protocols:
             print("Cache purged")
             return
         
-        print("Current Configuration:")
-        for key, value in self.resource_mgr.config.items():
-            if "key" in key and value:
-                print(f"  {key}: {'*' * 8}{value[-4:]}")
-            else:
-                print(f"  {key}: {value}")
+        if args.config:
+            print("Current Configuration:")
+            for key, value in self.resource_mgr.config.items():
+                if "key" in key and value:
+                    print(f"  {key}: {'*' * 8}{value[-4:]}")
+                else:
+                    print(f"  {key}: {value}")
+            return
     
     def generate_raw_data(self, city_data):
         data = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "system": "temporal-atmospheric-matrix",
+            "units": self.resource_mgr.config.get("units", "metric"),
             "data": {}
         }
         
@@ -547,15 +609,18 @@ Operational Protocols:
                 "timezone": config.timezone
             }
         
-        print(json.dumps(data, separators=(',', ':')))
+        print(json.dumps(data, indent=2))
     
     def execute_surveillance_cycle(self, args):
         if args.compare:
             city_data = {}
             for city_id in TemporalAcquisition.CITIES:
-                temp = self.temporal_engine.acquire_temporal(city_id)
-                atmos = self.atmospheric_engine.acquire_atmospheric(city_id)
-                city_data[city_id] = (temp, atmos)
+                try:
+                    temp = self.temporal_engine.acquire_temporal(city_id)
+                    atmos = self.atmospheric_engine.acquire_atmospheric(city_id)
+                    city_data[city_id] = (temp, atmos)
+                except Exception as e:
+                    print(f"Error acquiring data for {city_id}: {e}")
             
             if args.raw:
                 self.generate_raw_data(city_data)
@@ -576,21 +641,27 @@ Operational Protocols:
                 self.generate_raw_data(city_data)
             else:
                 for city_id in TemporalAcquisition.CITIES:
-                    temp = self.temporal_engine.acquire_temporal(city_id)
-                    atmos = self.atmospheric_engine.acquire_atmospheric(city_id)
-                    config = TemporalAcquisition.CITIES[city_id]
-                    matrix = self.display_engine.generate_city_matrix(temp, atmos, config)
-                    print(matrix + "\n")
+                    try:
+                        temp = self.temporal_engine.acquire_temporal(city_id)
+                        atmos = self.atmospheric_engine.acquire_atmospheric(city_id)
+                        config = TemporalAcquisition.CITIES[city_id]
+                        matrix = self.display_engine.generate_city_matrix(temp, atmos, config)
+                        print(matrix + "\n")
+                    except Exception as e:
+                        print(f"Error displaying {city_id}: {e}")
         else:
-            temp = self.temporal_engine.acquire_temporal(args.city)
-            atmos = self.atmospheric_engine.acquire_atmospheric(args.city)
-            config = TemporalAcquisition.CITIES[args.city]
-            
-            if args.raw:
-                self.generate_raw_data({args.city: (temp, atmos)})
-            else:
-                matrix = self.display_engine.generate_city_matrix(temp, atmos, config)
-                print(matrix)
+            try:
+                temp = self.temporal_engine.acquire_temporal(args.city)
+                atmos = self.atmospheric_engine.acquire_atmospheric(args.city)
+                config = TemporalAcquisition.CITIES[args.city]
+                
+                if args.raw:
+                    self.generate_raw_data({args.city: (temp, atmos)})
+                else:
+                    matrix = self.display_engine.generate_city_matrix(temp, atmos, config)
+                    print(matrix)
+            except Exception as e:
+                print(f"Error: {e}")
     
     def execute_continuous_surveillance(self, args):
         try:
@@ -628,7 +699,8 @@ def main():
     try:
         import pytz
     except ImportError:
-        print("Required modules: pip install pytz requests")
+        print("Error: Required modules not installed.")
+        print("Please run: pip install pytz requests urllib3")
         sys.exit(1)
     
     try:
@@ -638,7 +710,9 @@ def main():
         print("\nOperation terminated")
         sys.exit(0)
     except Exception as e:
-        print(f"System failure: {e}")
+        print(f"System error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 if __name__ == "__main__":
